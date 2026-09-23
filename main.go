@@ -9,10 +9,10 @@ import (
 	"io"
 	"log"
 	"maps"
-	"net"
 	"net/http"
 	"os"
 	"strings"
+	"sync"
 	"time"
 )
 
@@ -197,6 +197,63 @@ type ResponsesStreamEvent struct {
 	Delta    string                `json:"delta"`
 	Item     *ResponsesOutputItem  `json:"item"`
 	Response *ResponsesAPIResponse `json:"response"`
+}
+
+// TokenStats 只累计上游明确返回 usage 的请求；重启进程后清零。
+type TokenStats struct {
+	mu      sync.Mutex
+	console io.Writer
+	TokenStatsSnapshot
+}
+
+type TokenStatsSnapshot struct {
+	Requests     int64 `json:"requests"`
+	InputTokens  int64 `json:"input_tokens"`
+	OutputTokens int64 `json:"output_tokens"`
+	TotalTokens  int64 `json:"total_tokens"`
+}
+
+func (s *TokenStats) record(usage *ResponsesUsage) {
+	if usage == nil {
+		return
+	}
+	converted := convertUsage(usage)
+	s.mu.Lock()
+	s.Requests++
+	s.InputTokens += int64(converted.PromptTokens)
+	s.OutputTokens += int64(converted.CompletionTokens)
+	s.TotalTokens += int64(converted.TotalTokens)
+	s.refreshConsole()
+	s.mu.Unlock()
+}
+
+// 调用方持有 s.mu，避免并发请求把同一行写乱。
+func (s *TokenStats) refreshConsole() {
+	if s.console != nil {
+		fmt.Fprintf(s.console, "\r累计 Token | 请求: %d | 输入: %d | 输出: %d | 总计: %d", s.Requests, s.InputTokens, s.OutputTokens, s.TotalTokens)
+	}
+}
+
+func (s *TokenStats) snapshot() TokenStatsSnapshot {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.TokenStatsSnapshot
+}
+
+func handleUsage(stats *TokenStats, proxyAPIKey string) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodGet {
+			w.Header().Set("Allow", "GET")
+			http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+			return
+		}
+		if proxyAPIKey != "" && subtle.ConstantTimeCompare([]byte(r.Header.Get("Authorization")), []byte("Bearer "+proxyAPIKey)) != 1 {
+			writeAPIError(w, "Invalid proxy API key", http.StatusUnauthorized)
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		json.NewEncoder(w).Encode(stats.snapshot())
+	}
 }
 
 // ==================== 2. 工具函数 ====================
@@ -384,7 +441,7 @@ var upstreamClient = &http.Client{
 	},
 }
 
-func handleChatToResponsesProxy(responsesURL, upstreamAPIKey string) http.HandlerFunc {
+func handleChatToResponsesProxy(responsesURL, upstreamAPIKey string, stats *TokenStats) http.HandlerFunc {
 	proxyAPIKey := os.Getenv("PROXY_API_KEY")
 	return func(w http.ResponseWriter, r *http.Request) {
 		// 简单 CORS 支持
@@ -473,16 +530,16 @@ func handleChatToResponsesProxy(responsesURL, upstreamAPIKey string) http.Handle
 
 		// 4. 按流式/非流式分别转换响应
 		if chatReq.Stream {
-			handleStreamResponse(w, resp.Body, chatReq.Model, chatReq.StreamOptions != nil && chatReq.StreamOptions.IncludeUsage)
+			handleStreamResponse(w, resp.Body, chatReq.Model, chatReq.StreamOptions != nil && chatReq.StreamOptions.IncludeUsage, stats.record)
 		} else {
-			handleJSONResponse(w, resp.Body, chatReq.Model)
+			handleJSONResponse(w, resp.Body, chatReq.Model, stats.record)
 		}
 	}
 }
 
 // ==================== 5. 非流式响应转换: Responses -> Chat Completions ====================
 
-func handleJSONResponse(w http.ResponseWriter, upstreamBody io.Reader, reqModel string) {
+func handleJSONResponse(w http.ResponseWriter, upstreamBody io.Reader, reqModel string, onUsage ...func(*ResponsesUsage)) {
 	var out ResponsesAPIResponse
 	if err := json.NewDecoder(upstreamBody).Decode(&out); err != nil {
 		http.Error(w, fmt.Sprintf("Failed to parse upstream Responses payload: %v", err), http.StatusBadGateway)
@@ -553,6 +610,9 @@ func handleJSONResponse(w http.ResponseWriter, upstreamBody io.Reader, reqModel 
 
 	w.Header().Set("Content-Type", "application/json")
 	json.NewEncoder(w).Encode(chatResp)
+	if len(onUsage) > 0 {
+		onUsage[0](out.Usage)
+	}
 }
 
 // ==================== 6. 流式响应转换: Responses SSE -> Chat Completions SSE ====================
@@ -604,7 +664,7 @@ func convertUsage(usage *ResponsesUsage) *ChatUsage {
 	return &ChatUsage{PromptTokens: usage.InputTokens, CompletionTokens: usage.OutputTokens, TotalTokens: total}
 }
 
-func handleStreamResponse(w http.ResponseWriter, upstreamBody io.Reader, reqModel string, includeUsage bool) {
+func handleStreamResponse(w http.ResponseWriter, upstreamBody io.Reader, reqModel string, includeUsage bool, onUsage ...func(*ResponsesUsage)) {
 	flusher, ok := w.(http.Flusher)
 	if !ok {
 		writeAPIError(w, "Streaming unsupported", http.StatusInternalServerError)
@@ -716,6 +776,9 @@ func handleStreamResponse(w http.ResponseWriter, upstreamBody io.Reader, reqMode
 			if reason == "stop" && len(toolIndexByID) > 0 {
 				reason = "tool_calls"
 			}
+			if len(onUsage) > 0 {
+				onUsage[0](ev.Response.Usage)
+			}
 			if role() != nil || chunk(ChatChunkDelta{}, &reason) != nil {
 				return true
 			}
@@ -783,16 +846,18 @@ func main() {
 	port := envOr("PORT", "8081")
 	port = strings.TrimPrefix(port, ":")
 	// 默认只供本机使用；入口密钥与上游密钥分开，避免误转发。
-	addr := net.JoinHostPort(envOr("HOST", "127.0.0.1"), port)
+	addr := fmt.Sprintf(":%s", port)
 	if os.Getenv("PROXY_API_KEY") != "" && upstreamAPIKey == "" {
 		log.Fatal("PROXY_API_KEY requires UPSTREAM_API_KEY")
 	}
 
-	proxy := handleChatToResponsesProxy(responsesURL, upstreamAPIKey)
+	stats := &TokenStats{console: os.Stdout}
+	proxy := handleChatToResponsesProxy(responsesURL, upstreamAPIKey, stats)
 
 	// 同时注册带/不带 /v1 前缀的端点,兼容各类客户端
 	http.HandleFunc("/v1/chat/completions", proxy)
 	http.HandleFunc("/chat/completions", proxy)
+	http.HandleFunc("/usage", handleUsage(stats, os.Getenv("PROXY_API_KEY")))
 
 	http.HandleFunc("/healthz", func(w http.ResponseWriter, r *http.Request) {
 		w.Write([]byte("ok"))
@@ -801,6 +866,7 @@ func main() {
 	log.Printf("代理已启动!本地 Chat Completions 地址: http://%s/v1/chat/completions", addr)
 	log.Printf("请求将被自动转换为上游 Responses API: %s", responsesURL)
 	log.Printf("提示: 可通过环境变量 UPSTREAM_BASE_URL / HOST / PORT 配置地址，PROXY_API_KEY 配置入口鉴权")
+	stats.refreshConsole()
 
 	server := &http.Server{Addr: addr, ReadHeaderTimeout: 10 * time.Second, IdleTimeout: 90 * time.Second}
 	if err := server.ListenAndServe(); err != nil {
