@@ -55,6 +55,7 @@ type ChatMessage struct {
 }
 
 type ChatCompletionRequest struct {
+	N                   *int                   `json:"n,omitempty"`
 	MaxCompletionTokens *int                   `json:"max_completion_tokens,omitempty"`
 	ResponseFormat      map[string]interface{} `json:"response_format,omitempty"`
 	StreamOptions       *struct {
@@ -214,7 +215,7 @@ type TokenStatsSnapshot struct {
 }
 
 func (s *TokenStats) record(usage *ResponsesUsage) {
-	if usage == nil {
+	if s == nil || usage == nil {
 		return
 	}
 	converted := convertUsage(usage)
@@ -247,13 +248,17 @@ func handleUsage(stats *TokenStats, proxyAPIKey string) http.HandlerFunc {
 			http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
 			return
 		}
-		if proxyAPIKey != "" && subtle.ConstantTimeCompare([]byte(r.Header.Get("Authorization")), []byte("Bearer "+proxyAPIKey)) != 1 {
+		if !authorized(r, proxyAPIKey) {
 			writeAPIError(w, "Invalid proxy API key", http.StatusUnauthorized)
 			return
 		}
 		w.Header().Set("Content-Type", "application/json")
 		json.NewEncoder(w).Encode(stats.snapshot())
 	}
+}
+
+func authorized(r *http.Request, key string) bool {
+	return key == "" || subtle.ConstantTimeCompare([]byte(r.Header.Get("Authorization")), []byte("Bearer "+key)) == 1
 }
 
 // ==================== 2. 工具函数 ====================
@@ -456,7 +461,7 @@ func handleChatToResponsesProxy(responsesURL, upstreamAPIKey string, stats *Toke
 			http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
 			return
 		}
-		if proxyAPIKey != "" && subtle.ConstantTimeCompare([]byte(r.Header.Get("Authorization")), []byte("Bearer "+proxyAPIKey)) != 1 {
+		if !authorized(r, proxyAPIKey) {
 			writeAPIError(w, "Invalid proxy API key", http.StatusUnauthorized)
 			return
 		}
@@ -479,7 +484,6 @@ func handleChatToResponsesProxy(responsesURL, upstreamAPIKey string, stats *Toke
 			writeAPIError(w, "model and messages are required", http.StatusBadRequest)
 			return
 		}
-
 		// 2. 转换为 Responses API 请求结构
 		respReq := convertChatToResponsesReq(&chatReq)
 
@@ -530,16 +534,16 @@ func handleChatToResponsesProxy(responsesURL, upstreamAPIKey string, stats *Toke
 
 		// 4. 按流式/非流式分别转换响应
 		if chatReq.Stream {
-			handleStreamResponse(w, resp.Body, chatReq.Model, chatReq.StreamOptions != nil && chatReq.StreamOptions.IncludeUsage, stats.record)
+			handleStreamResponse(w, resp.Body, chatReq.Model, chatReq.StreamOptions != nil && chatReq.StreamOptions.IncludeUsage, stats)
 		} else {
-			handleJSONResponse(w, resp.Body, chatReq.Model, stats.record)
+			handleJSONResponse(w, resp.Body, chatReq.Model, stats)
 		}
 	}
 }
 
 // ==================== 5. 非流式响应转换: Responses -> Chat Completions ====================
 
-func handleJSONResponse(w http.ResponseWriter, upstreamBody io.Reader, reqModel string, onUsage ...func(*ResponsesUsage)) {
+func handleJSONResponse(w http.ResponseWriter, upstreamBody io.Reader, reqModel string, stats *TokenStats) {
 	var out ResponsesAPIResponse
 	if err := json.NewDecoder(upstreamBody).Decode(&out); err != nil {
 		http.Error(w, fmt.Sprintf("Failed to parse upstream Responses payload: %v", err), http.StatusBadGateway)
@@ -610,9 +614,7 @@ func handleJSONResponse(w http.ResponseWriter, upstreamBody io.Reader, reqModel 
 
 	w.Header().Set("Content-Type", "application/json")
 	json.NewEncoder(w).Encode(chatResp)
-	if len(onUsage) > 0 {
-		onUsage[0](out.Usage)
-	}
+	stats.record(out.Usage)
 }
 
 // ==================== 6. 流式响应转换: Responses SSE -> Chat Completions SSE ====================
@@ -664,7 +666,7 @@ func convertUsage(usage *ResponsesUsage) *ChatUsage {
 	return &ChatUsage{PromptTokens: usage.InputTokens, CompletionTokens: usage.OutputTokens, TotalTokens: total}
 }
 
-func handleStreamResponse(w http.ResponseWriter, upstreamBody io.Reader, reqModel string, includeUsage bool, onUsage ...func(*ResponsesUsage)) {
+func handleStreamResponse(w http.ResponseWriter, upstreamBody io.Reader, reqModel string, includeUsage bool, stats *TokenStats) {
 	flusher, ok := w.(http.Flusher)
 	if !ok {
 		writeAPIError(w, "Streaming unsupported", http.StatusInternalServerError)
@@ -776,9 +778,7 @@ func handleStreamResponse(w http.ResponseWriter, upstreamBody io.Reader, reqMode
 			if reason == "stop" && len(toolIndexByID) > 0 {
 				reason = "tool_calls"
 			}
-			if len(onUsage) > 0 {
-				onUsage[0](ev.Response.Usage)
-			}
+			stats.record(ev.Response.Usage)
 			if role() != nil || chunk(ChatChunkDelta{}, &reason) != nil {
 				return true
 			}
@@ -843,7 +843,7 @@ func main() {
 	upstreamBaseURL := envOr("UPSTREAM_BASE_URL", "http://172.20.156.12:9695/v1")
 	responsesURL := joinResponsesURL(upstreamBaseURL)
 	upstreamAPIKey := os.Getenv("UPSTREAM_API_KEY") // 可选:代理统一注入密钥
-	port := envOr("PORT", "8081")
+	port := envOr("PORT", "8881")
 	port = strings.TrimPrefix(port, ":")
 	// 默认只供本机使用；入口密钥与上游密钥分开，避免误转发。
 	addr := fmt.Sprintf(":%s", port)
